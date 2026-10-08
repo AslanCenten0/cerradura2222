@@ -3,11 +3,11 @@ const ASSETS_TO_CACHE = [
   '/',
   '/index.html',
   '/manifest.webmanifest',
-  '/css/style.css',
+  '/style.css',
   '/js/app.js',
   '/js/recognition.js',
   '/js/bluetooth.js',
-  '/icons/icon.svg'
+  '/icon.svg'
 ];
 
 self.addEventListener('install', (event) => {
