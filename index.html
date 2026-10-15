@@ -532,6 +532,12 @@
     let timerRfidInterval = null;
 
     function ejecutarAperturaRemota() {
+      // Disparador configurable (sobreescrito abajo por Firebase)
+      if (window._firebaseAbrirRemoto) {
+        window._firebaseAbrirRemoto();
+        return;
+      }
+
       const texto = document.getElementById('panelEstadoTexto');
       const badge = document.getElementById('panelEstadoBadge');
       const dot = document.getElementById('panelPulseDot');
@@ -613,6 +619,92 @@
         lista.removeChild(lista.lastChild);
       }
     }
+  </script>
+
+  <!-- ── SINCRONIZACIÓN NUBE (FIREBASE REALTIME DATABASE) ── -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.9.0/firebase-app.js";
+    import { getDatabase, ref, onValue, set } from "https://www.gstatic.com/firebasejs/10.9.0/firebase-database.js";
+
+    // ── CONFIGURACIÓN DE TU BASE DE DATOS EN LA NUBE ──
+    const firebaseConfig = {
+      databaseURL: "https://TU_PROYECTO-default-rtdb.firebaseio.com"
+    };
+
+    let db = null;
+    try {
+      if (firebaseConfig.databaseURL && !firebaseConfig.databaseURL.includes("TU_PROYECTO")) {
+        const app = initializeApp(firebaseConfig);
+        db = getDatabase(app);
+        console.log("🔥 Firebase Realtime Database conectado.");
+
+        // 1. Escuchar estado en vivo emitido por el ESP32
+        const cerraduraRef = ref(db, 'cerradura');
+        onValue(cerraduraRef, (snapshot) => {
+          const data = snapshot.val();
+          if (!data) return;
+
+          const texto = document.getElementById('panelEstadoTexto');
+          const badge = document.getElementById('panelEstadoBadge');
+          const dot = document.getElementById('panelPulseDot');
+          const ultimoMetodo = document.getElementById('panelMetodoUltimo');
+          const btnAbrir = document.getElementById('btnAccionAbrir');
+
+          if (ultimoMetodo && data.metodo) {
+            ultimoMetodo.textContent = data.metodo;
+          }
+
+          if (data.estado === "ABIERTO") {
+            if (window.decryptText) window.decryptText(texto, "ABIERTO", 450, 30);
+            else texto.textContent = "ABIERTO";
+
+            badge.className = "opt-badge badge-green";
+            badge.textContent = "DESBLOQUEADO";
+            dot.style.backgroundColor = "var(--accent-emerald)";
+            dot.style.boxShadow = "0 0 10px var(--accent-emerald)";
+            btnAbrir.disabled = true;
+            agregarLog("APERTURA", data.metodo || "ESP32");
+          } else if (data.estado === "BLOQUEADO") {
+            if (window.decryptText) window.decryptText(texto, "BLOQUEADO", 450, 30);
+            else texto.textContent = "BLOQUEADO";
+
+            badge.className = "opt-badge badge-amber";
+            badge.textContent = "SEGURIDAD";
+            dot.style.backgroundColor = "var(--accent-amber)";
+            dot.style.boxShadow = "0 0 10px var(--accent-amber)";
+            btnAbrir.disabled = true;
+            agregarLog("BLOQUEO", "Fuerza Bruta");
+          } else {
+            if (window.decryptText) window.decryptText(texto, "CERRADO", 450, 30);
+            else texto.textContent = "CERRADO";
+
+            badge.className = "opt-badge badge-red";
+            badge.textContent = "BLOQUEADA";
+            dot.style.backgroundColor = "var(--accent-rose)";
+            dot.style.boxShadow = "0 0 10px var(--accent-rose)";
+            btnAbrir.disabled = false;
+          }
+        });
+      }
+    } catch(err) {
+      console.warn("Firebase no inicializado:", err);
+    }
+
+    // 2. Función de apertura remota que escribe en la nube
+    window._firebaseAbrirRemoto = async function() {
+      const btnAbrir = document.getElementById('btnAccionAbrir');
+      btnAbrir.disabled = true;
+
+      if (db) {
+        try {
+          agregarLog("ORDEN", "Enviando a la nube...");
+          await set(ref(db, 'cerradura/comando_abrir'), true);
+        } catch(e) {
+          console.error("Error al escribir en Firebase:", e);
+          btnAbrir.disabled = false;
+        }
+      }
+    };
   </script>
 
   <!-- Orquestador Principal (Módulos ES6) -->
