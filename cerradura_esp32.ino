@@ -1,8 +1,8 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  NEXUS-7 — Cerradura Inteligente Autónoma (v4.0 IoT Cloud)               ║
-// ║  ESP32 + RFID RC522 + Servo + Telegram Bot + Sincronización Firebase    ║
-// ║  Core 0: Tarea Segura Telegram | Core 1: Sensores, Servo y Firebase REST ║
-// ║  (Teclado y WebServer local eliminados — 100% Autónomo a 5V)           ║
+// ║  NEXUS-7 — Cerradura Inteligente Autónoma IoT                           ║
+// ║  ESP32 + RFID RC522 + Servo + Sincronización Nube Firebase              ║
+// ║  (Teclado, Servidor Web local y Bot de Telegram eliminados)             ║
+// ║  100% Autónomo: Solo requiere fuente de 5V y conexión Wi-Fi             ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 #include <WiFi.h>
@@ -12,7 +12,6 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <ArduinoJson.h>
-#include <UniversalTelegramBot.h>
 
 // ────────────────────────────────────────────────────────────
 //  1. CONFIGURACIÓN WI-FI
@@ -21,30 +20,13 @@ const char* ssid     = "Estudiantes";
 const char* password = "educar_2018";
 
 // ────────────────────────────────────────────────────────────
-//  2. CONFIGURACIÓN FIREBASE REALTIME DATABASE (OPCIÓN 2)
+//  2. CONFIGURACIÓN FIREBASE REALTIME DATABASE
 //  (Reemplaza con la URL de tu base de datos de Firebase)
 // ────────────────────────────────────────────────────────────
 const String FIREBASE_HOST = "https://TU_PROYECTO-default-rtdb.firebaseio.com";
 
 // ────────────────────────────────────────────────────────────
-//  3. TELEGRAM BOT (CORE 0)
-// ────────────────────────────────────────────────────────────
-#define BOT_TOKEN "8666531292:AAEbz8E8FHfgvheELbMyETtH_YrtYgQfoCc"
-#define CHAT_ID "7925238559"
-
-WiFiClientSecure client_secure;
-UniversalTelegramBot bot(BOT_TOKEN, client_secure);
-
-// Cola segura de mensajes y Mutex de FreeRTOS
-const int MAX_MENSAJES = 5;
-String colaMensajes[MAX_MENSAJES];
-int colaHead = 0;
-int colaTail = 0;
-int colaCount = 0;
-SemaphoreHandle_t mutexCerradura;
-
-// ────────────────────────────────────────────────────────────
-//  4. HARDWARE: SERVO & RFID & LEDS
+//  3. HARDWARE: SERVO & RFID & LEDS
 // ────────────────────────────────────────────────────────────
 Servo miServo;
 #define PIN_SERVO 4
@@ -52,123 +34,45 @@ Servo miServo;
 #define SS_PIN  5
 #define RST_PIN 22
 MFRC522 mfrc522(SS_PIN, RST_PIN);
-byte usuarioAutorizado[4] = {0x62, 0x55, 0x14, 0x5C}; // UID tarjeta autorizada
+byte usuarioAutorizado[4] = {0x62, 0x55, 0x14, 0x5C}; // UID de la tarjeta autorizada
 
 #define LED_ROJO  15
 #define LED_VERDE  2
 
 // ────────────────────────────────────────────────────────────
-//  5. ESTADOS Y TIEMPOS
+//  4. ESTADOS Y TIEMPOS
 // ────────────────────────────────────────────────────────────
 String estadoCerradura = "CERRADO";
 String metodoAcceso    = "---";
 
 unsigned long tiempoApertura       = 0;
-const unsigned long TIEMPO_ABIERTO = 5000UL; // Cierre automático a los 5s
+const unsigned long TIEMPO_ABIERTO = 5000UL; // Cierre automático a los 5 segundos
 
 // Temporizador para consultar Firebase
 unsigned long ultimoCheckFirebase   = 0;
-const unsigned long INTERVALO_CHECK = 1200UL; // Cada 1.2 segundos
+const unsigned long INTERVALO_CHECK = 1200UL; // Consulta cada 1.2 segundos
 
-// Modo RFID Libre (Bypass 60 segundos)
+// Modo RFID Libre (Bypass por 60 segundos)
 bool         rfidLibre      = false;
 unsigned long tRfidLibre    = 0;
 const unsigned long DUR_RFID_LIBRE = 60000UL;
 
-// Declaraciones adelantadas
+// Declaraciones adelantadas de funciones
 void abrirCerradura(const char* metodo);
 void cerrarCerradura();
 void actualizarFirebase(const String& estado, const String& metodo);
 void verificarComandoFirebase();
 
 // ════════════════════════════════════════════════════════════
-//  TELEGRAM (COLA Y TAREA EN CORE 0)
-// ════════════════════════════════════════════════════════════
-void agregarMensajeCola(const String& mensaje) {
-  xSemaphoreTake(mutexCerradura, portMAX_DELAY);
-  if (colaCount < MAX_MENSAJES) {
-    colaMensajes[colaHead] = mensaje;
-    colaHead = (colaHead + 1) % MAX_MENSAJES;
-    colaCount++;
-  }
-  xSemaphoreGive(mutexCerradura);
-}
-
-void enviarAlertaTelegram(const String& mensaje) {
-  agregarMensajeCola(mensaje);
-}
-
-void telegramTask(void* parameter) {
-  delay(2000);
-  client_secure.setInsecure(); // No validar certificados SSL para ahorrar RAM
-  
-  while (true) {
-    vTaskDelay(1000 / portTICK_PERIOD_MS); 
-    
-    if (WiFi.status() == WL_CONNECTED) {
-      // 1. Enviar alertas pendientes
-      bool hayMensaje = false;
-      String mensajeAEnviar = "";
-
-      xSemaphoreTake(mutexCerradura, portMAX_DELAY);
-      if (colaCount > 0) {
-        mensajeAEnviar = colaMensajes[colaTail];
-        hayMensaje = true;
-      }
-      xSemaphoreGive(mutexCerradura);
-
-      if (hayMensaje) {
-        bool ok = bot.sendMessage(CHAT_ID, mensajeAEnviar, "");
-        if (ok) {
-          xSemaphoreTake(mutexCerradura, portMAX_DELAY);
-          colaTail = (colaTail + 1) % MAX_MENSAJES;
-          colaCount--;
-          xSemaphoreGive(mutexCerradura);
-        } else {
-          vTaskDelay(1000 / portTICK_PERIOD_MS);
-          continue;
-        }
-      }
-      
-      // 2. Escuchar comandos remotos de Telegram
-      int numMensajes = bot.getUpdates(bot.last_message_received + 1);
-      while (numMensajes) {
-        for (int i = 0; i < numMensajes; i++) {
-          telegramMessage msg = bot.messages[i];
-          String chat_id = msg.chat_id;
-          String text = msg.text;
-
-          if (text == "/start") {
-            String welcome = "🔐 *NEXUS-7 Control Remoto*\n\nSelecciona una acción:";
-            String keyboardJson = "[[{\"text\":\"🔓 Abrir Puerta\",\"callback_data\":\"abrir\"},{\"text\":\"🔒 Cerrar Puerta\",\"callback_data\":\"cerrar\"}]]";
-            bot.sendMessageWithInlineKeyboard(chat_id, welcome, "", keyboardJson);
-
-          } else if (msg.type == "callback_query") {
-            String callbackData = msg.text;
-            if (callbackData == "abrir") {
-              abrirCerradura("TELEGRAM");
-              bot.sendMessage(CHAT_ID, "✅ Puerta abierta desde Telegram", "");
-            } else if (callbackData == "cerrar") {
-              cerrarCerradura();
-              bot.sendMessage(CHAT_ID, "✅ Puerta cerrada desde Telegram", "");
-            }
-          }
-        }
-        numMensajes = bot.getUpdates(bot.last_message_received + 1);
-      }
-    }
-    yield();
-  }
-}
-
-// ════════════════════════════════════════════════════════════
 //  SINCRONIZACIÓN CON FIREBASE (NUBE)
 // ════════════════════════════════════════════════════════════
+
+// Actualiza el estado en la nube para que la web en Vercel cambie en vivo
 void actualizarFirebase(const String& estado, const String& metodo) {
   if (WiFi.status() != WL_CONNECTED || FIREBASE_HOST.indexOf("TU_PROYECTO") >= 0) return;
   
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure(); // No validar certificados SSL para optimizar memoria RAM
   HTTPClient https;
 
   String url = FIREBASE_HOST + "/cerradura.json";
@@ -180,6 +84,7 @@ void actualizarFirebase(const String& estado, const String& metodo) {
   }
 }
 
+// Revisa si desde la web de Vercel presionaron "Abrir Puerta"
 void verificarComandoFirebase() {
   if (WiFi.status() != WL_CONNECTED || FIREBASE_HOST.indexOf("TU_PROYECTO") >= 0) return;
 
@@ -193,9 +98,9 @@ void verificarComandoFirebase() {
     if (httpCode == 200) {
       String payload = https.getString();
       if (payload == "true") {
-        Serial.println("🌐 [VERCEL] Orden de apertura remota recibida desde Firebase");
+        Serial.println("🌐 [VERCEL] Orden de apertura remota recibida desde la nube");
         
-        // Resetear la orden a false inmediatamente
+        // Resetear la orden a false inmediatamente en Firebase
         https.begin(client, url);
         https.addHeader("Content-Type", "application/json");
         https.PUT("false");
@@ -214,32 +119,28 @@ void abrirCerradura(const char* metodo) {
   metodoAcceso    = metodo;
   estadoCerradura = "ABIERTO";
   
-  miServo.write(180); // Giro de apertura
+  miServo.write(180); // Giro de apertura del cerrojo
   digitalWrite(LED_ROJO,  LOW);
   digitalWrite(LED_VERDE, HIGH);
   tiempoApertura = millis();
 
-  // Actualizar la nube para que la web en Vercel se ponga en verde
+  // Actualizar la nube en tiempo real (Vercel se pone verde al instante)
   actualizarFirebase("ABIERTO", metodoAcceso);
-
-  // Notificar al bot de Telegram
-  String notif = "🔓 *Puerta abierta*\nMétodo: ";
-  notif += metodo;
-  enviarAlertaTelegram(notif);
   
-  Serial.print("ABIERTO — Método: "); Serial.println(metodo);
+  Serial.print("🔓 ABIERTO — Método: "); Serial.println(metodo);
 }
 
 void cerrarCerradura() {
   estadoCerradura = "CERRADO";
   
-  miServo.write(0); // Giro de bloqueo
+  miServo.write(0); // Giro de bloqueo del cerrojo
   digitalWrite(LED_ROJO,  HIGH);
   digitalWrite(LED_VERDE, LOW);
 
-  // Actualizar la nube para que la web en Vercel se ponga en rojo
+  // Actualizar la nube en tiempo real (Vercel se pone rojo)
   actualizarFirebase("CERRADO", metodoAcceso);
-  Serial.println("Cerradura cerrada.");
+  
+  Serial.println("🔒 Cerradura bloqueada.");
 }
 
 // ════════════════════════════════════════════════════════════
@@ -249,19 +150,21 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  mutexCerradura = xSemaphoreCreateMutex();
-
+  // Configuración de LEDs
   pinMode(LED_ROJO,  OUTPUT);
   pinMode(LED_VERDE, OUTPUT);
   digitalWrite(LED_ROJO,  HIGH);
   digitalWrite(LED_VERDE, LOW);
 
+  // Configuración del Servomotor
   miServo.attach(PIN_SERVO);
   miServo.write(0); // Posición inicial cerrada
 
+  // Inicialización del lector RFID RC522
   SPI.begin();
   mfrc522.PCD_Init();
-  Serial.println("\n--- INICIANDO NEXUS-7 ---");
+  Serial.println("\n--- NEXUS-7 CONTROL DE ACCESO ---");
+  Serial.println("Hardware: RFID RC522 + Servo + Firebase Cloud");
 
   // Conexión Wi-Fi
   Serial.printf("Conectando a Wi-Fi: %s\n", ssid);
@@ -270,49 +173,38 @@ void setup() {
     delay(500);
     Serial.print(".");
   }
-  Serial.printf("\nWi-Fi Conectado — IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("\nWi-Fi Conectado exitosamente. IP: %s\n", WiFi.localIP().toString().c_str());
 
   // Estado inicial en la nube
   actualizarFirebase("CERRADO", "INICIO");
 
-  // Crear Tarea de Telegram en CORE 0
-  xTaskCreatePinnedToCore(
-    telegramTask,
-    "TelegramTask",
-    8192,
-    NULL,
-    1,
-    NULL,
-    0 // Core 0 dedicado
-  );
-
-  Serial.println("Sistema sincronizado. Listo para operar.\n");
+  Serial.println("Sistema 100% operativo y sincronizado con la nube.\n");
 }
 
 // ════════════════════════════════════════════════════════════
-//  LOOP PRINCIPAL (CORE 1)
+//  LOOP PRINCIPAL
 // ════════════════════════════════════════════════════════════
 void loop() {
   unsigned long ahora = millis();
 
-  // 1. Consultar comandos remotos desde la web de Vercel
+  // 1. Consultar si hay órdenes de apertura desde la web de Vercel
   if (ahora - ultimoCheckFirebase >= INTERVALO_CHECK) {
     ultimoCheckFirebase = ahora;
     verificarComandoFirebase();
   }
 
-  // 2. Cierre automático no bloqueante tras 5 segundos
+  // 2. Cierre automático tras 5 segundos de apertura
   if (estadoCerradura == "ABIERTO" && (ahora - tiempoApertura >= TIEMPO_ABIERTO)) {
     cerrarCerradura();
   }
 
-  // 3. Expiración de modo RFID Libre (Bypass)
+  // 3. Expiración del modo RFID Libre (Bypass 60 segundos)
   if (rfidLibre && (ahora - tRfidLibre >= DUR_RFID_LIBRE)) {
     rfidLibre = false;
-    Serial.println("[RFID] Bypass de 60s finalizado.");
+    Serial.println("[RFID] Bypass de 60s expirado.");
   }
 
-  // 4. Lectura de tarjeta RFID física
+  // 4. Lectura de tarjeta física RFID
   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
     Serial.print("Tarjeta detectada. UID:");
     for (byte i = 0; i < mfrc522.uid.size; i++) {
@@ -331,7 +223,8 @@ void loop() {
       if (autorizada) {
         abrirCerradura("RFID");
       } else {
-        Serial.println("RFID DENEGADO.");
+        Serial.println("RFID DENEGADO — Tarjeta no autorizada.");
+        // Parpadeo de advertencia en LED rojo
         digitalWrite(LED_ROJO, LOW); delay(150); digitalWrite(LED_ROJO, HIGH);
       }
     }
