@@ -7,6 +7,10 @@
 
 import { BluetoothController } from './bluetooth.js';
 import { FaceRecognitionEngine } from './recognition.js';
+import { initBackgroundGrid, initSpotlightCards, initClickSparks, decryptText } from './effects.js';
+
+// Exponer decryptText para que el panel de control pueda usarlo
+window.decryptText = decryptText;
 
 // Cooldown de 6 segundos tras apertura exitosa
 const COOLDOWN_DURATION = 6000;
@@ -57,7 +61,15 @@ class NexusApp {
   }
 
   async init() {
-    console.log("🚀 Iniciando Nexus Access Client...");
+    // 0. Inicializar Efectos Visuales React Bits
+    initBackgroundGrid('bgCanvas');
+    initSpotlightCards();
+    initClickSparks();
+
+    const brandName = document.querySelector('.brand-name');
+    if (brandName) {
+      decryptText(brandName, "NEXUS ACCESS", 900, 35);
+    }
 
     // 1. Inicializar PWA Service Worker
     this.registerServiceWorker();

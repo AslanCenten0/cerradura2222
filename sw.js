@@ -7,6 +7,7 @@ const ASSETS_TO_CACHE = [
   '/js/app.js',
   '/js/recognition.js',
   '/js/bluetooth.js',
+  '/js/effects.js',
   '/icon.svg'
 ];
 

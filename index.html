@@ -219,13 +219,16 @@
 </head>
 <body>
 
+  <!-- Canvas de Fondo Interactivo (React Bits Aurora + Squares Grid) -->
+  <canvas id="bgCanvas" class="bg-canvas"></canvas>
+
   <div class="app-container">
 
     <!-- ── BARRA SUPERIOR ── -->
     <header class="nav-bar">
       <div class="brand">
         <div class="brand-dot"></div>
-        <div class="brand-name">NEXUS <span class="brand-thin">ACCESS</span></div>
+        <div class="brand-name shiny-text">NEXUS <span class="brand-thin">ACCESS</span></div>
       </div>
 
       <div class="header-actions">
@@ -534,7 +537,12 @@
       const dot = document.getElementById('panelPulseDot');
       const btnAbrir = document.getElementById('btnAccionAbrir');
 
-      texto.textContent = "ABIERTO";
+      if (window.decryptText) {
+        window.decryptText(texto, "ABIERTO", 450, 30);
+      } else {
+        texto.textContent = "ABIERTO";
+      }
+
       badge.className = "opt-badge badge-green";
       badge.textContent = "DESBLOQUEADO";
       dot.style.backgroundColor = "var(--accent-emerald)";
@@ -555,7 +563,12 @@
       const badge = document.getElementById('panelEstadoBadge');
       const dot = document.getElementById('panelPulseDot');
 
-      texto.textContent = "CERRADO";
+      if (window.decryptText) {
+        window.decryptText(texto, "CERRADO", 450, 30);
+      } else {
+        texto.textContent = "CERRADO";
+      }
+
       badge.className = "opt-badge badge-red";
       badge.textContent = "BLOQUEADA";
       dot.style.backgroundColor = "var(--accent-rose)";
