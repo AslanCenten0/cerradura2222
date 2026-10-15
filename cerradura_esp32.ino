@@ -23,7 +23,7 @@ const char* password = "educar_2018";
 //  2. CONFIGURACIÓN FIREBASE REALTIME DATABASE
 //  (Reemplaza con la URL de tu base de datos de Firebase)
 // ────────────────────────────────────────────────────────────
-const String FIREBASE_HOST = "https://TU_PROYECTO-default-rtdb.firebaseio.com";
+const String FIREBASE_HOST = "https://nexus-cerradura-default-rtdb.firebaseio.com";
 
 // ────────────────────────────────────────────────────────────
 //  3. HARDWARE: SERVO & RFID & LEDS
