@@ -32,7 +32,14 @@ export class FaceRecognitionEngine {
   async loadModels() {
     try {
       if (typeof faceapi === 'undefined') {
-        throw new Error("faceapi no está definido en el ámbito global.");
+        if (this.onStatusMessage) this.onStatusMessage("Descargando reconocimiento facial...");
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.12/dist/face-api.js';
+          s.onload = resolve;
+          s.onerror = () => reject(new Error("No se pudo descargar face-api."));
+          document.head.appendChild(s);
+        });
       }
 
       if (this.onStatusMessage) this.onStatusMessage("Inicializando red neuronal...");
@@ -260,10 +267,10 @@ export class FaceRecognitionEngine {
   drawMinimalHUD(box, match) {
     const { x, y, width, height } = box;
     const isAuth = !!match;
-    const color = isAuth ? '#34C759' : '#FFFFFF';
+    const color = isAuth ? '#3fcf7e' : '#ffb14a';
 
     this.ctx.save();
-    this.ctx.lineWidth = 2;
+    this.ctx.lineWidth = 3;
     this.ctx.strokeStyle = color;
     this.ctx.shadowColor = 'rgba(0, 0, 0, 0.45)';
     this.ctx.shadowBlur = 4;
@@ -295,10 +302,12 @@ export class FaceRecognitionEngine {
     this.ctx.stroke();
 
     if (isAuth) {
-      this.ctx.font = '500 12px -apple-system, sans-serif';
+      // El canvas se muestra en espejo (CSS scaleX(-1)): invertimos solo el texto para que se lea bien
+      this.ctx.font = '600 18px -apple-system, sans-serif';
       this.ctx.fillStyle = color;
       this.ctx.shadowBlur = 6;
-      this.ctx.fillText(match.name, x + 4, y - 8);
+      this.ctx.scale(-1, 1);
+      this.ctx.fillText(match.name, -(x + width) + 4, y - 10);
     }
 
     this.ctx.restore();

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'nexus-access-v13';
+const CACHE_NAME = 'nexus-access-v20';
 const ASSETS_TO_CACHE = [
   './',
   'index.html',
@@ -6,7 +6,7 @@ const ASSETS_TO_CACHE = [
   'style.css',
   'js/app.js',
   'js/recognition.js',
-  'js/effects.js',
+  'js/lock.js',
   'icon.svg',
   'icon-192.png',
   'icon-512.png'
@@ -15,7 +15,7 @@ const ASSETS_TO_CACHE = [
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      console.log('[PWA SW] Pre-caching static assets v13');
+      console.log('[PWA SW] Pre-caching static assets v20');
       return cache.addAll(ASSETS_TO_CACHE).catch(e => console.warn('Pre-cache error:', e));
     })
   );

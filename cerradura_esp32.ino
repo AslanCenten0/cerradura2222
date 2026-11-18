@@ -1,12 +1,13 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  NEXUS-7 — Cerradura Inteligente IoT (Dual-Core Asíncrono v7.0)          ║
-// ║  ESP32 + Matriz 4x4 (Core 1) + Firebase HTTPS en Segundo Plano (Core 0) ║
-// ║  • Core 1: Teclado ultra-sensible a 1000Hz (CERO teclas perdidas)       ║
-// ║  • Core 0: Wi-Fi y Firebase aislados (las peticiones no congelan CPU)   ║
-// ║  • Debounce 25ms para eliminar falsos contactos de membrana              ║
-// ║  • PIN maestro: "201106" + '#' -> Apertura continua                      ║
-// ║  • Tecla '*' (o 'D'): Cierra / Bloquea manualmente la cerradura         ║
-// ║  • Servo calibrado: CERRADO = 180° / ABIERTO = 0° (anti-jitter)          ║
+// ║  NEXUS-7 — Cerradura Inteligente IoT (v8.0 · bloqueo por intentos)        ║
+// ║  ESP32 + Matriz 4x4 (Core 1) + Firebase HTTPS en segundo plano (Core 0)   ║
+// ║  • PIN maestro: "201106" + '#'  -> abre (queda abierta)                   ║
+// ║  • '*' o 'D' con la cerradura abierta -> cierra                           ║
+// ║  • 3 PIN incorrectos seguidos en el teclado -> TECLADO BLOQUEADO:         ║
+// ║      cierra la cerradura, ignora el teclado y las aperturas remotas        ║
+// ║      hasta que la web envíe "comando_desbloquear" (PIN 201106 en la web). ║
+// ║      El bloqueo se guarda en memoria (NVS): sobrevive a un corte de luz.  ║
+// ║  • Servo calibrado: CERRADO = 180° / ABIERTO = 0°                         ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 #include <WiFi.h>
@@ -14,379 +15,385 @@
 #include <HTTPClient.h>
 #include <ESP32Servo.h>
 #include <Keypad.h>
-#include <ArduinoJson.h>
+#include <Preferences.h>
 
 // ────────────────────────────────────────────────────────────
-//  1. CONFIGURACIÓN WI-FI
+//  1. WI-FI
 // ────────────────────────────────────────────────────────────
 const char* ssid     = "Estudiantes";
 const char* password = "educar_2018";
 
 // ────────────────────────────────────────────────────────────
-//  2. CONFIGURACIÓN FIREBASE REALTIME DATABASE
+//  2. FIREBASE REALTIME DATABASE
 // ────────────────────────────────────────────────────────────
 const String FIREBASE_HOST = "https://nexus-cerradura-default-rtdb.firebaseio.com";
 
 // ────────────────────────────────────────────────────────────
-//  3. HARDWARE: SERVO Y CALIBRACIÓN DE ÁNGULOS
+//  3. SERVO Y LEDS
 // ────────────────────────────────────────────────────────────
 #define PIN_SERVO 18
 Servo miServo;
-
-// Calibración mecánica:
-// CERRADO: 180° (traba hacia abajo)
-// ABIERTO:   0° (libera el cerrojo hacia arriba)
 const int ANGULO_CERRADO = 180;
 const int ANGULO_ABIERTO = 0;
 
-// Indicadores LED
-#define LED_ROJO  15  // Encendido cuando está CERRADO / Alarma
-#define LED_VERDE  2  // Encendido cuando está ABIERTO / Acceso OK
+#define LED_ROJO  15  // Cerrado / alarma
+#define LED_VERDE  2  // Abierto / acceso OK
 
 // ────────────────────────────────────────────────────────────
-//  4. HARDWARE: MATRIZ DE TECLADO 4x4
+//  4. TECLADO 4x4
 // ────────────────────────────────────────────────────────────
 const byte FILAS = 4;
 const byte COLUMNAS = 4;
-
 char teclas[FILAS][COLUMNAS] = {
   {'1', '2', '3', 'A'},
   {'4', '5', '6', 'B'},
   {'7', '8', '9', 'C'},
   {'*', '0', '#', 'D'}
 };
-
-// Pines GPIO asignados al ESP32:
-byte pinesFilas[FILAS]       = {19, 21, 22, 23}; // R1, R2, R3, R4
-byte pinesColumnas[COLUMNAS] = {25, 26, 27, 32}; // C1, C2, C3, C4
-
+byte pinesFilas[FILAS]       = {19, 21, 22, 23};
+byte pinesColumnas[COLUMNAS] = {25, 26, 27, 32};
 Keypad teclado = Keypad(makeKeymap(teclas), pinesFilas, pinesColumnas, FILAS, COLUMNAS);
 
-// Clave maestra para apertura física por teclado
 const String CLAVE_MAESTRA = "201106";
+const int    MAX_INTENTOS  = 3;
 String bufferClave = "";
 
 // ────────────────────────────────────────────────────────────
-//  5. ESTADOS Y VARIABLES COMPARTIDAS ENTRE NÚCLEOS
+//  5. ESTADO (Core 1 escribe, Core 0 lee a través de un snapshot protegido)
 // ────────────────────────────────────────────────────────────
-String estadoCerradura = "CERRADO";
-String metodoAcceso    = "---";
+Preferences memoria;           // NVS: guarda bloqueo e intentos
 
-// Flags de comunicación asíncrona entre Core 0 (Firebase) y Core 1 (Teclado/Servo)
-volatile bool ordenWebAbrir           = false;
-volatile bool ordenWebCerrar          = false;
-volatile bool syncFirebasePendiente    = false;
-String        syncEstadoPendiente     = "CERRADO";
-String        syncMetodoPendiente     = "INICIO";
+bool   abierta          = false;
+bool   tecladoBloqueado = false;
+int    intentosFallidos = 0;
+String metodoAcceso     = "INICIO";
 
-TaskHandle_t tareaFirebaseHandle = NULL;
+// Órdenes que llegan desde la web (Core 0 -> Core 1)
+volatile bool ordenWebAbrir       = false;
+volatile bool ordenWebCerrar      = false;
+volatile bool ordenWebDesbloquear = false;
 
-// Declaraciones de funciones
-void moverServo(int angulo);
-void abrirCerradura(const char* metodo);
-void cerrarCerradura();
-void enviarActualizacionFirebase(const String& estado, const String& metodo);
-void verificarComandosFirebase();
-void procesarTeclado();
-void tareaFirebaseCore0(void *pvParameters);
+// Snapshot para Firebase (Core 1 -> Core 0)
+portMUX_TYPE  muxSync = portMUX_INITIALIZER_UNLOCKED;
+char          cuerpoPendiente[200];
+volatile bool syncPendiente = false;
+
+// Copias que Core 0 puede leer sin tocar Strings de Core 1
+volatile bool vistaAbierta  = false;
+volatile bool vistaBloqueo  = false;
+
+TaskHandle_t tareaRedHandle = NULL;
 
 // ════════════════════════════════════════════════════════════
-//  CONTROL DE SERVO SUAVE Y SIN VIBRACIONES (ANTI-JITTER)
+//  UTILIDADES
 // ════════════════════════════════════════════════════════════
 void moverServo(int angulo) {
   miServo.setPeriodHertz(50);
   miServo.attach(PIN_SERVO, 500, 2400);
   miServo.write(angulo);
-  delay(500); // 500ms para completar el recorrido mecánico
-  miServo.detach(); // Detach apaga los pulsos PWM: elimina vibración, calor y consumo
+  delay(500);
+  miServo.detach(); // sin pulsos PWM: sin vibración ni calor
+}
+
+void parpadear(int pin, int veces, int ms, bool terminarEncendido) {
+  for (int i = 0; i < veces; i++) {
+    digitalWrite(pin, !terminarEncendido); delay(ms);
+    digitalWrite(pin,  terminarEncendido); delay(ms);
+  }
+}
+
+void guardarMemoria() {
+  memoria.putBool("bloqueo", tecladoBloqueado);
+  memoria.putInt("intentos", intentosFallidos);
+}
+
+// Prepara el JSON con el estado completo y avisa a Core 0 que lo envíe
+void pedirSync() {
+  char cuerpo[200];
+  snprintf(cuerpo, sizeof(cuerpo),
+    "{\"estado\":\"%s\",\"metodo\":\"%s\",\"bloqueado\":%s,\"intentos\":%d}",
+    abierta ? "ABIERTO" : "CERRADO",
+    metodoAcceso.c_str(),
+    tecladoBloqueado ? "true" : "false",
+    intentosFallidos);
+
+  portENTER_CRITICAL(&muxSync);
+  strncpy(cuerpoPendiente, cuerpo, sizeof(cuerpoPendiente) - 1);
+  cuerpoPendiente[sizeof(cuerpoPendiente) - 1] = '\0';
+  syncPendiente = true;
+  vistaAbierta  = abierta;
+  vistaBloqueo  = tecladoBloqueado;
+  portEXIT_CRITICAL(&muxSync);
 }
 
 // ════════════════════════════════════════════════════════════
-//  ACCIONES DE CERRADURA (EJECUTADAS EN CORE 1)
+//  ACCIONES (Core 1)
 // ════════════════════════════════════════════════════════════
 void abrirCerradura(const char* metodo) {
-  metodoAcceso    = metodo;
-  estadoCerradura = "ABIERTO";
-  
+  metodoAcceso = metodo;
+  abierta = true;
   digitalWrite(LED_ROJO,  LOW);
   digitalWrite(LED_VERDE, HIGH);
-  moverServo(ANGULO_ABIERTO); // 0°: Libera cerrojo hacia arriba
-  
-  // Solicitar actualización a Firebase sin bloquear el Core 1
-  syncEstadoPendiente  = "ABIERTO";
-  syncMetodoPendiente  = metodoAcceso;
-  syncFirebasePendiente = true;
-
-  Serial.printf("🔓 ABIERTO — Método: %s (Apertura continua hasta presionar '*' o 'Cerrar')\n", metodo);
+  moverServo(ANGULO_ABIERTO);
+  pedirSync();
+  Serial.printf("🔓 ABIERTO — Método: %s\n", metodo);
 }
 
-void cerrarCerradura() {
-  estadoCerradura = "CERRADO";
-  bufferClave     = ""; // Limpiar cualquier dígito pendiente
-  
+void cerrarCerradura(const char* metodo) {
+  metodoAcceso = metodo;
+  abierta = false;
+  bufferClave = "";
   digitalWrite(LED_ROJO,  HIGH);
   digitalWrite(LED_VERDE, LOW);
-  moverServo(ANGULO_CERRADO); // 180°: Traba cerrojo hacia abajo
+  moverServo(ANGULO_CERRADO);
+  pedirSync();
+  Serial.println("🔒 Cerradura cerrada.");
+}
 
-  // Solicitar actualización a Firebase sin bloquear el Core 1
-  syncEstadoPendiente  = "CERRADO";
-  syncMetodoPendiente  = metodoAcceso;
-  syncFirebasePendiente = true;
+void bloquearTeclado() {
+  tecladoBloqueado = true;
+  guardarMemoria();
+  Serial.println("⛔ 3 PIN incorrectos: TECLADO BLOQUEADO. Desbloquear desde la web.");
+  if (abierta) {
+    cerrarCerradura("BLOQUEO_TECLADO");   // ya hace pedirSync()
+  } else {
+    metodoAcceso = "BLOQUEO_TECLADO";
+    pedirSync();
+  }
+  parpadear(LED_ROJO, 6, 70, true);
+}
 
-  Serial.println("🔒 Cerradura bloqueada.");
+void desbloquearTeclado() {
+  tecladoBloqueado = false;
+  intentosFallidos = 0;
+  bufferClave = "";
+  metodoAcceso = "DESBLOQUEO_WEB";
+  guardarMemoria();
+  pedirSync();
+  parpadear(LED_VERDE, 3, 90, false);
+  Serial.println("✅ Teclado desbloqueado desde la web.");
 }
 
 // ════════════════════════════════════════════════════════════
-//  PROCESAMIENTO DE TECLADO MATRICIAL 4x4 (CORE 1 - TIEMPO REAL)
+//  TECLADO (Core 1, tiempo real)
 // ════════════════════════════════════════════════════════════
 void procesarTeclado() {
   char tecla = teclado.getKey();
   if (!tecla) return;
 
-  Serial.printf("⌨️ Tecla detectada: [%c]\n", tecla);
-
-  // 1. SI LA CERRADURA ESTÁ ABIERTA:
-  // Pulsar '*' o 'D' bloquea inmediatamente
-  if (estadoCerradura == "ABIERTO") {
-    if (tecla == '*' || tecla == 'D') {
-      Serial.printf("🔒 Botón [%c] pulsado en la matriz. Bloqueando de inmediato...\n", tecla);
-      cerrarCerradura();
-      return;
-    }
+  // Bloqueado: el teclado no hace nada, solo avisa con el LED rojo
+  if (tecladoBloqueado) {
+    Serial.println("⛔ Teclado bloqueado: tecla ignorada.");
+    parpadear(LED_ROJO, 2, 60, true);
+    return;
   }
 
-  // 2. SI LA CERRADURA ESTÁ CERRADA:
-  // Tecla '*' -> Cancelar / borrar buffer
+  // Abierta: '*' o 'D' cierra
+  if (abierta && (tecla == '*' || tecla == 'D')) {
+    cerrarCerradura("TECLADO_4X4");
+    return;
+  }
+
+  // '*' borra lo escrito
   if (tecla == '*') {
-    Serial.println("❌ Entrada cancelada / Buffer borrado.");
     bufferClave = "";
-    digitalWrite(LED_ROJO, LOW); delay(80); digitalWrite(LED_ROJO, HIGH);
+    parpadear(LED_ROJO, 1, 80, true);
     return;
   }
 
-  // Tecla '#' -> Confirmar PIN (Enter)
+  // '#' confirma
   if (tecla == '#') {
-    Serial.printf("🔑 Verificando PIN ingresado: [%s]\n", bufferClave.c_str());
-    
+    if (bufferClave.length() == 0) return; // '#' suelto no cuenta como intento
+
     if (bufferClave == CLAVE_MAESTRA) {
-      Serial.println("✅ PIN CORRECTO. Desbloqueando...");
-      for (int i = 0; i < 2; i++) {
-        digitalWrite(LED_VERDE, HIGH); delay(60);
-        digitalWrite(LED_VERDE, LOW);  delay(60);
-      }
-      abrirCerradura("TECLADO_4X4");
+      Serial.println("✅ PIN correcto.");
+      bool habiaErrores = intentosFallidos > 0;
+      intentosFallidos = 0;
+      if (habiaErrores) guardarMemoria();
+      parpadear(LED_VERDE, 2, 60, false);
+      if (!abierta) abrirCerradura("TECLADO_4X4");
+      else pedirSync();
     } else {
-      Serial.println("⛔ PIN INCORRECTO. Acceso denegado.");
-      for (int i = 0; i < 3; i++) {
-        digitalWrite(LED_ROJO, LOW);  delay(80);
-        digitalWrite(LED_ROJO, HIGH); delay(80);
+      intentosFallidos++;
+      guardarMemoria();
+      Serial.printf("⛔ PIN incorrecto (%d de %d).\n", intentosFallidos, MAX_INTENTOS);
+      parpadear(LED_ROJO, 3, 80, true);
+      if (intentosFallidos >= MAX_INTENTOS) {
+        bloquearTeclado();
+      } else {
+        metodoAcceso = "PIN_INCORRECTO";
+        pedirSync();
       }
     }
-    
-    bufferClave = ""; // Limpiar tras evaluar
+    bufferClave = "";
     return;
   }
 
-  // Dígitos numéricos (1-9, 0, A, B, C)
+  // Dígitos y letras
   if (bufferClave.length() < 10) {
     bufferClave += tecla;
-    Serial.printf("PIN actual (%d digitos): ", bufferClave.length());
-    for (unsigned int i = 0; i < bufferClave.length(); i++) Serial.print("*");
-    Serial.println();
-    
-    // Feedback táctil instantáneo (solo 15ms para no entorpecer tipeo rápido)
     digitalWrite(LED_VERDE, HIGH);
     delay(15);
-    digitalWrite(LED_VERDE, LOW);
+    digitalWrite(LED_VERDE, abierta ? HIGH : LOW);
   }
 }
 
 // ════════════════════════════════════════════════════════════
-//  TAREA ASÍNCRONA EN SEGUNDO PLANO (CORE 0 - FIREBASE & WIFI)
+//  RED (Core 0)
 // ════════════════════════════════════════════════════════════
-void enviarActualizacionFirebase(const String& estado, const String& metodo) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  
+void enviarSnapshot() {
+  char cuerpo[200];
+  portENTER_CRITICAL(&muxSync);
+  strncpy(cuerpo, cuerpoPendiente, sizeof(cuerpo));
+  syncPendiente = false;
+  portEXIT_CRITICAL(&muxSync);
+
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(2);
-  
+  HTTPClient https;
+  https.setTimeout(2000);
+  if (https.begin(client, FIREBASE_HOST + "/cerradura.json")) {
+    https.addHeader("Content-Type", "application/json");
+    int code = https.PATCH(String(cuerpo));
+    https.end();
+    if (code != 200) {
+      // reintentar en la próxima vuelta
+      portENTER_CRITICAL(&muxSync);
+      syncPendiente = true;
+      portEXIT_CRITICAL(&muxSync);
+    }
+  }
+}
+
+// Lee /cerradura/<nombre>; si vale true lo vuelve a false y devuelve true
+bool consumirComando(const char* nombre) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(2);
   HTTPClient https;
   https.setTimeout(2000);
 
-  String url = FIREBASE_HOST + "/cerradura.json";
+  String url = FIREBASE_HOST + "/cerradura/" + nombre + ".json";
+  if (!https.begin(client, url)) return false;
+  int code = https.GET();
+  String payload = code == 200 ? https.getString() : "";
+  https.end();
+  payload.trim();
+  if (payload != "true") return false;
+
   if (https.begin(client, url)) {
     https.addHeader("Content-Type", "application/json");
-    String body = "{\"estado\":\"" + estado + "\",\"metodo\":\"" + metodo + "\"}";
-    https.PATCH(body);
+    https.PUT("false");
     https.end();
   }
+  return true;
 }
 
-void verificarComandosFirebase() {
-  if (WiFi.status() != WL_CONNECTED) return;
+void verificarComandos() {
+  bool bloqueo, abiertaAhora;
+  portENTER_CRITICAL(&muxSync);
+  bloqueo = vistaBloqueo;
+  abiertaAhora = vistaAbierta;
+  portEXIT_CRITICAL(&muxSync);
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(2);
-  
-  HTTPClient https;
-  https.setTimeout(2000);
-
-  // 1. Consultar si enviaron orden de abrir desde la web
-  if (estadoCerradura != "ABIERTO") {
-    String urlAbrir = FIREBASE_HOST + "/cerradura/comando_abrir.json";
-    if (https.begin(client, urlAbrir)) {
-      int httpCode = https.GET();
-      if (httpCode == 200) {
-        String payload = https.getString();
-        payload.trim();
-        https.end();
-
-        if (payload == "true") {
-          Serial.println("🌐 [WEB] Orden de APERTURA recibida.");
-          
-          if (https.begin(client, urlAbrir)) {
-            https.addHeader("Content-Type", "application/json");
-            https.PUT("false");
-            https.end();
-          }
-          
-          ordenWebAbrir = true; // Notificar a Core 1
-          return;
-        }
-      } else {
-        https.end();
-      }
+  if (bloqueo) {
+    // Mientras está bloqueada solo se acepta el desbloqueo
+    if (consumirComando("comando_desbloquear")) {
+      Serial.println("🌐 [WEB] Orden de DESBLOQUEO recibida.");
+      ordenWebDesbloquear = true;
     }
+    return;
   }
 
-  // 2. Consultar si enviaron orden de cerrar desde la web
-  if (estadoCerradura == "ABIERTO") {
-    String urlCerrar = FIREBASE_HOST + "/cerradura/comando_cerrar.json";
-    if (https.begin(client, urlCerrar)) {
-      int httpCode = https.GET();
-      if (httpCode == 200) {
-        String payload = https.getString();
-        payload.trim();
-        https.end();
-
-        if (payload == "true") {
-          Serial.println("🔒 [WEB] Orden de CIERRE MANUAL recibida.");
-          
-          if (https.begin(client, urlCerrar)) {
-            https.addHeader("Content-Type", "application/json");
-            https.PUT("false");
-            https.end();
-          }
-          
-          ordenWebCerrar = true; // Notificar a Core 1
-          return;
-        }
-      } else {
-        https.end();
-      }
+  if (!abiertaAhora) {
+    if (consumirComando("comando_abrir")) {
+      Serial.println("🌐 [WEB] Orden de APERTURA recibida.");
+      ordenWebAbrir = true;
+    }
+  } else {
+    if (consumirComando("comando_cerrar")) {
+      Serial.println("🌐 [WEB] Orden de CIERRE recibida.");
+      ordenWebCerrar = true;
     }
   }
 }
 
-// Bucle en segundo plano dedicado exclusivamente a la red en Core 0
-void tareaFirebaseCore0(void *pvParameters) {
+void tareaRedCore0(void *pvParameters) {
   for (;;) {
     if (WiFi.status() == WL_CONNECTED) {
-      // 1. Si hay una actualización de estado pendiente, enviarla
-      if (syncFirebasePendiente) {
-        syncFirebasePendiente = false;
-        enviarActualizacionFirebase(syncEstadoPendiente, syncMetodoPendiente);
-      }
-
-      // 2. Verificar comandos remotos en Firebase
-      verificarComandosFirebase();
+      if (syncPendiente) enviarSnapshot();
+      verificarComandos();
     }
-    
-    // Intervalo de consulta sin interferir con el teclado
     vTaskDelay(pdMS_TO_TICKS(1200));
   }
 }
 
 // ════════════════════════════════════════════════════════════
-//  SETUP (INICIALIZACIÓN)
+//  SETUP
 // ════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // Configuración de LEDs indicadores
   pinMode(LED_ROJO,  OUTPUT);
   pinMode(LED_VERDE, OUTPUT);
-  digitalWrite(LED_ROJO,  HIGH); // Comienza CERRADO
+  digitalWrite(LED_ROJO,  HIGH);
   digitalWrite(LED_VERDE, LOW);
 
-  // Posición inicial del Servomotor: Bloqueado (180°)
   moverServo(ANGULO_CERRADO);
 
-  // Configuración de sensibilidad y debounce del teclado físico
-  teclado.setDebounceTime(25); // 25ms para eliminar rebotes y falsos contactos
+  teclado.setDebounceTime(25);
   teclado.setHoldTime(400);
 
-  Serial.println("\n╔═══════════════════════════════════════════════════════╗");
-  Serial.println("║  NEXUS-7 — TECLADO 4x4 DE ALTA SENSIBILIDAD DUAL-CORE ║");
-  Serial.println("╚═══════════════════════════════════════════════════════╝");
-  Serial.printf("Servo GPIO: %d (Cerrado: %d°, Abierto: %d°)\n", PIN_SERVO, ANGULO_CERRADO, ANGULO_ABIERTO);
-  Serial.printf("Filas Teclado:    [%d, %d, %d, %d]\n", pinesFilas[0], pinesFilas[1], pinesFilas[2], pinesFilas[3]);
-  Serial.printf("Columnas Teclado: [%d, %d, %d, %d]\n", pinesColumnas[0], pinesColumnas[1], pinesColumnas[2], pinesColumnas[3]);
+  // Recuperar bloqueo e intentos (un corte de luz no borra el bloqueo)
+  memoria.begin("cerradura", false);
+  tecladoBloqueado = memoria.getBool("bloqueo", false);
+  intentosFallidos = memoria.getInt("intentos", 0);
+  metodoAcceso     = tecladoBloqueado ? "BLOQUEO_TECLADO" : "INICIO";
 
-  // Conexión Wi-Fi
+  Serial.println("\n╔══════════════════════════════════════════════╗");
+  Serial.println("║  NEXUS-7 v8 — bloqueo tras 3 PIN incorrectos ║");
+  Serial.println("╚══════════════════════════════════════════════╝");
+  if (tecladoBloqueado) Serial.println("⛔ Arranca con el teclado BLOQUEADO (desbloquear desde la web).");
+
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   Serial.printf("Conectando a Wi-Fi: %s", ssid);
   WiFi.begin(ssid, password);
-  
-  int intentos = 0;
-  while (WiFi.status() != WL_CONNECTED && intentos < 20) {
+  int intentosWifi = 0;
+  while (WiFi.status() != WL_CONNECTED && intentosWifi < 20) {
     delay(300);
     Serial.print(".");
-    intentos++;
+    intentosWifi++;
   }
+  Serial.println(WiFi.status() == WL_CONNECTED
+    ? "\nWi-Fi conectado."
+    : "\nSin Wi-Fi: funciona solo con el teclado.");
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nWi-Fi Conectado. IP: %s\n", WiFi.localIP().toString().c_str());
-    enviarActualizacionFirebase("CERRADO", "INICIO");
-  } else {
-    Serial.println("\nWi-Fi no conectado. Modo local autónomo activo.");
-  }
+  pedirSync(); // publica el estado inicial (incluye bloqueo e intentos)
 
-  // Iniciar la tarea de Firebase aislada en Core 0 para que NUNCA bloquee la lectura de teclas
-  xTaskCreatePinnedToCore(
-    tareaFirebaseCore0,    // Función de la tarea
-    "TareaFirebase",       // Nombre
-    8192,                  // Stack en bytes (holgado para TLS/HTTPS)
-    NULL,                  // Parámetros
-    1,                     // Prioridad
-    &tareaFirebaseHandle,  // Handle
-    0                      // Ejecutar en Core 0
-  );
-
-  Serial.println("✅ Tarea de red aislada en Core 0.");
-  Serial.println("✅ Teclado 4x4 corriendo a máxima velocidad en Core 1.");
-  Serial.println("Sistema 100% operativo. Abre con [201106#] y cierra con [*].\n");
+  xTaskCreatePinnedToCore(tareaRedCore0, "TareaRed", 8192, NULL, 1, &tareaRedHandle, 0);
+  Serial.println("Listo. Abre con [201106#], cierra con [*].\n");
 }
 
 // ════════════════════════════════════════════════════════════
-//  LOOP PRINCIPAL (CORE 1 - TIEMPO REAL ULTRA-RÁPIDO)
+//  LOOP (Core 1)
 // ════════════════════════════════════════════════════════════
 void loop() {
-  // 1. Lectura inmediata de teclas en la matriz 4x4 a máxima frecuencia
   procesarTeclado();
 
-  // 2. Atender órdenes web provenientes de Core 0
+  if (ordenWebDesbloquear) {
+    ordenWebDesbloquear = false;
+    if (tecladoBloqueado) desbloquearTeclado();
+  }
   if (ordenWebAbrir) {
     ordenWebAbrir = false;
-    abrirCerradura("WEB_MANUAL");
+    if (!tecladoBloqueado && !abierta) abrirCerradura("WEB");
   }
   if (ordenWebCerrar) {
     ordenWebCerrar = false;
-    cerrarCerradura();
+    if (abierta) cerrarCerradura("WEB");
   }
 
   yield();

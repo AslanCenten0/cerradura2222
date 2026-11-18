@@ -1,700 +1,593 @@
 /**
- * ═════════════════════════════════════════════════════════════════════
- *  app.js — Orquestador Principal de la Aplicación
- *  Enlaza la interfaz minimalista Apple y el motor biométrico con Firebase
- * ═════════════════════════════════════════════════════════════════════
+ * app.js — Nexus · Cerradura
+ * Estado en vivo, órdenes con PIN, bloqueo del teclado, reconocimiento facial y actividad.
  */
-
+import { LockLink } from './lock.js';
 import { FaceRecognitionEngine } from './recognition.js';
-import { initBackgroundGrid, initSpotlightCards, initClickSparks, decryptText } from './effects.js';
 
-// Exponer decryptText para que el panel de control pueda usarlo
-window.decryptText = decryptText;
+const PIN = '201106';
+const PIN_LENGTH = 6;
+const MAX_TRIES = 3;
+const FACE_COOLDOWN_MS = 6000;
+const COMMAND_TIMEOUT_MS = 12000;
+const ACTIVITY_KEY = 'nexus_activity_v2';
+const TAB_KEY = 'nexus_tab_v2';
 
-// Cooldown tras apertura exitosa
-const COOLDOWN_DURATION = 6000;
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-export class NexusApp {
+const store = {
+  get(key, fallback) {
+    try { const v = localStorage.getItem(key); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* modo privado */ }
+  },
+};
+
+// Cómo se describe cada "metodo" que publica el ESP32
+const VIA = {
+  TECLADO_4X4: 'con el teclado',
+  WEB: 'desde la web',
+  WEB_MANUAL: 'desde la web',
+  BLOQUEO_TECLADO: 'por bloqueo del teclado',
+  DESBLOQUEO_WEB: 'desde la web',
+  PIN_INCORRECTO: '',
+  INICIO: 'al encender',
+};
+
+// Texto bajo el estado grande, según el último "metodo"
+const SUB = {
+  TECLADO_4X4: 'Último cambio con el teclado',
+  WEB: 'Último cambio desde la web',
+  WEB_MANUAL: 'Último cambio desde la web',
+  BLOQUEO_TECLADO: 'Se cerró por el bloqueo del teclado',
+  DESBLOQUEO_WEB: 'Teclado desbloqueado desde la web',
+  PIN_INCORRECTO: 'Hubo un PIN incorrecto en el teclado',
+  INICIO: 'Recién encendida',
+};
+
+class App {
   constructor() {
-    this.engine = null;
-    this.deferredPrompt = null;
-    this.pendingUnlockMethod = null;
+    this.link = null;
+    this.lock = null;          // último estado conocido
+    this.online = false;
+    this.pending = null;       // { action, label, timer }
+    this.lastChangeAt = null;
+    this.activity = store.get(ACTIVITY_KEY, []);
 
-    this.cooldownUntil = 0;
-    this.audioContext = null;
+    this.engine = new FaceRecognitionEngine($('#webcam'), $('#overlay'));
+    this.cameraState = 'off';  // off | starting | on | error
+    this.faceCooldownUntil = 0;
+    this.frames = 0;
 
-    // Referencias al DOM
-    this.dom = {
-      video: document.getElementById('webcam'),
-      canvas: document.getElementById('overlayCanvas'),
-      cameraWrapper: document.getElementById('cameraWrapper'),
-      loader: document.getElementById('loaderSplash'),
-      loaderMsg: document.getElementById('loaderMessage'),
-      toast: document.getElementById('feedbackToast'),
-      toastMsg: document.getElementById('toastMessage'),
-      statusPulse: document.getElementById('statusPulse'),
-      statusText: document.getElementById('statusText'),
-      cooldownTimer: document.getElementById('cooldownTimer'),
-      fpsCounter: document.getElementById('fpsCounter'),
-      scanReticle: document.getElementById('scanReticle'),
-      
-      btnOpenUsers: document.getElementById('btnOpenUsers'),
-      badgeUserCount: document.getElementById('badgeUserCount'),
-      btnManualUnlock: document.getElementById('btnManualUnlock'),
-      btnRegisterFace: document.getElementById('btnRegisterFace'),
-      btnQuickLockCamera: document.getElementById('btnQuickLockCamera'),
-      
-      // Modal 1: Usuarios
-      modalUsers: document.getElementById('modalUsers'),
-      btnCloseModal: document.getElementById('btnCloseModal'),
-      userList: document.getElementById('userList'),
-      btnClearAllUsers: document.getElementById('btnClearAllUsers'),
-      
-      // Modal 2: Registrar Rostro
-      modalPromptName: document.getElementById('modalPromptName'),
-      inputUserName: document.getElementById('inputUserName'),
-      btnCancelEnroll: document.getElementById('btnCancelEnroll'),
-      btnConfirmEnroll: document.getElementById('btnConfirmEnroll'),
-      inputAdminPassword: document.getElementById('inputAdminPassword'),
-      btnTogglePassword: document.getElementById('btnTogglePassword'),
-      enrollErrorMsg: document.getElementById('enrollErrorMsg'),
-
-      // Modal 3: PWA / Descargar
-      btnInstallApp: document.getElementById('btnInstallApp'),
-      labelInstallApp: document.getElementById('labelInstallApp'),
-      modalInstall: document.getElementById('modalInstall'),
-      btnCloseInstallModal: document.getElementById('btnCloseInstallModal'),
-      btnCloseInstallSheet: document.getElementById('btnCloseInstallSheet'),
-      installNativeSection: document.getElementById('installNativeSection'),
-      btnTriggerNativeInstall: document.getElementById('btnTriggerNativeInstall'),
-
-      // Modal 4: PIN de Seguridad para Apertura
-      modalAuthUnlock: document.getElementById('modalAuthUnlock'),
-      inputUnlockPassword: document.getElementById('inputUnlockPassword'),
-      btnToggleUnlockPassword: document.getElementById('btnToggleUnlockPassword'),
-      unlockErrorMsg: document.getElementById('unlockErrorMsg'),
-      btnCancelAuthUnlock: document.getElementById('btnCancelAuthUnlock'),
-      btnConfirmAuthUnlock: document.getElementById('btnConfirmAuthUnlock'),
-      btnCloseAuthUnlock: document.getElementById('btnCloseAuthUnlock'),
-
-      btnEnableCamera: document.getElementById('btnEnableCamera'),
-    };
+    this.pin = { value: '', onOk: null };
+    this.installPrompt = null;
   }
 
-  async init() {
-    console.log("🚀 NexusApp.init() iniciando...");
+  init() {
+    this.bindTabs();
+    this.bindActions();
+    this.bindPinPad();
+    this.bindSheets();
+    this.bindEnroll();
+    this.bindUsers();
+    this.bindInstall();
+    this.renderActivity();
+    this.renderUsers();
+    this.render();
 
-    // 0. Inicializar Efectos Visuales
     try {
-      initBackgroundGrid('bgCanvas');
-      initSpotlightCards();
-      initClickSparks();
-    } catch (e) {
-      console.warn("Efectos visuales no críticos:", e);
-    }
-
-    const brandName = document.querySelector('.brand-name');
-    if (brandName) {
-      decryptText(brandName, "NEXUS ACCESS", 900, 35);
-    }
-
-    // 1. Conectar Eventos de la Interfaz
-    this.bindUIEvents();
-
-    // 2. Registrar Service Worker para PWA
-    this.registerServiceWorker();
-
-    // 3. Inicializar Motor Biométrico
-    this.engine = new FaceRecognitionEngine(this.dom.video, this.dom.canvas);
-    this.updateUserBadge();
-
-    // 4. Iniciar Cámara de forma prioritaria e INMEDIATA (sin esperar modelos pesados)
-    const cameraPromise = this.tryStartCamera();
-
-    // 5. Cargar Redes Neuronales en paralelo en segundo plano
-    const modelsPromise = (async () => {
-      try {
-        if (this.dom.statusText) this.dom.statusText.textContent = "Cargando IA facial...";
-        await this.engine.loadModels();
-        if (this.dom.statusText) this.dom.statusText.textContent = "Esperando rostro...";
-        console.log("✅ Modelos neuronales listos para reconocimiento.");
-      } catch (errModels) {
-        console.warn("Advertencia cargando modelos neuronales:", errModels);
-        if (this.dom.statusText) this.dom.statusText.textContent = "Error al cargar IA facial";
-      }
-    })();
-
-    // 6. Medidor de FPS
-    this.startFPSMeter();
-
-    await Promise.allSettled([cameraPromise, modelsPromise]);
-    console.log("✅ NexusApp.init() completamente activo.");
-  }
-
-  async tryStartCamera() {
-    try {
-      if (this.dom.loaderMsg) this.dom.loaderMsg.textContent = "Conectando cámara...";
-      console.log("📷 Iniciando tryStartCamera...");
-      
-      await this.engine.startCamera();
-
-      // Ocultar pantalla de carga de inmediato
-      if (this.dom.loader) {
-        this.dom.loader.classList.add('hidden');
-        setTimeout(() => {
-          if (this.dom.loader) this.dom.loader.style.display = 'none';
-        }, 300);
-      }
-      this.showToast("Cámara activa");
-
-      // Iniciar bucle de detección facial
-      this.engine.onFaceDetected = (result) => this.handleFaceDetection(result);
-      this.engine.startLoop();
-
-      if (this.dom.btnEnableCamera) {
-        this.dom.btnEnableCamera.style.display = 'none';
-      }
-      console.log("✅ Cámara y stream activos.");
+      this.link = new LockLink();
+      this.link.listen({
+        onState: (s, prev) => this.onLockState(s, prev),
+        onOnline: (on) => { this.online = on; this.renderLink(); },
+      });
     } catch (err) {
-      console.error("❌ Error al iniciar la cámara:", err);
-      if (this.dom.loaderMsg) {
-        this.dom.loaderMsg.textContent = "Permiso de cámara requerido.";
-      }
-      
-      if (this.dom.btnEnableCamera) {
-        this.dom.btnEnableCamera.style.display = 'inline-flex';
-        this.dom.btnEnableCamera.onclick = async (e) => {
-          e.stopPropagation();
-          if (this.dom.loaderMsg) this.dom.loaderMsg.textContent = "Solicitando permisos...";
-          this.dom.btnEnableCamera.style.display = 'none';
-          await this.tryStartCamera();
-        };
-      }
+      console.error('Firebase no disponible:', err);
+      this.toast('No se pudo conectar con la cerradura', 'alert');
     }
-  }
 
-  /**
-   * Registro de Service Worker para PWA
-   */
-  registerServiceWorker() {
+    this.setTab(store.get(TAB_KEY, 'camara'));
+    setInterval(() => this.renderSub(), 30000);
+    setInterval(() => { $('#camFps').textContent = this.cameraState === 'on' && !document.hidden ? `${this.frames} fps` : ''; this.frames = 0; }, 1000);
+    document.addEventListener('visibilitychange', () => this.syncCameraLoop());
+
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js?v=13')
-        .then(reg => {
-          console.log("✅ PWA Service Worker registrado con éxito:", reg.scope);
-          reg.update().catch(() => {});
-        })
-        .catch(err => console.log("PWA SW no registrado:", err));
+      navigator.serviceWorker.register('sw.js?v=20').catch(() => {});
     }
   }
 
-  /**
-   * Procesamiento de rostros detectados en tiempo real
-   */
-  handleFaceDetection({ hasFace, match }) {
-    const ahora = Date.now();
-    const reticle = this.dom.scanReticle;
+  /* ═════════ Estado de la cerradura ═════════ */
 
-    // Si la cerradura ya está abierta en Firebase, no re-disparar apertura innecesariamente
-    const panelTexto = document.getElementById('panelEstadoTexto');
-    if (panelTexto && panelTexto.textContent === "ABIERTO") {
-      if (reticle) reticle.className = "scan-reticle authorized";
-      if (this.dom.statusText) this.dom.statusText.textContent = "Cerradura abierta";
-      if (this.dom.statusPulse) this.dom.statusPulse.className = "pulse-ring active";
+  get uiState() {
+    if (!this.lock) return 'unknown';
+    if (this.lock.bloqueado) return 'blocked';
+    return this.lock.estado === 'ABIERTO' ? 'open' : 'closed';
+  }
+
+  onLockState(s, prev) {
+    if (prev) {
+      this.lastChangeAt = Date.now();
+      const label = this.pending?.label;
+
+      if (!prev.bloqueado && s.bloqueado) {
+        this.log('Teclado bloqueado: 3 PIN incorrectos', 'alert');
+        this.toast('Teclado bloqueado por 3 PIN incorrectos', 'alert', 4200);
+        navigator.vibrate?.([80, 60, 80]);
+      } else if (prev.bloqueado && !s.bloqueado) {
+        this.log('Teclado desbloqueado desde la web', 'open');
+      } else if (!s.bloqueado && s.intentos > prev.intentos) {
+        this.log(`PIN incorrecto en el teclado (${s.intentos} de ${MAX_TRIES})`, 'alert');
+      }
+
+      if (prev.estado !== s.estado) {
+        const open = s.estado === 'ABIERTO';
+        const via = label || VIA[s.metodo] || '';
+        this.log(`${open ? 'Abierta' : 'Cerrada'}${via ? ' ' + via : ''}`, open ? 'open' : 'neutral');
+      }
+    }
+
+    this.lock = s;
+    this.resolvePending();
+    this.render();
+  }
+
+  resolvePending() {
+    const p = this.pending;
+    if (!p || !this.lock) return;
+    const done =
+      (p.action === 'abrir' && this.lock.estado === 'ABIERTO') ||
+      (p.action === 'cerrar' && this.lock.estado === 'CERRADO') ||
+      (p.action === 'desbloquear' && !this.lock.bloqueado);
+    if (!done) return;
+    clearTimeout(p.timer);
+    this.pending = null;
+    const msg = { abrir: 'Cerradura abierta', cerrar: 'Cerradura cerrada', desbloquear: 'Teclado desbloqueado' }[p.action];
+    this.toast(msg, p.action === 'cerrar' ? 'neutral' : 'open');
+  }
+
+  async send(action, label) {
+    if (!this.link || this.pending) return;
+    navigator.vibrate?.(12);
+    this.pending = { action, label };
+    this.render();
+    try {
+      await this.link[action]();
+    } catch (err) {
+      console.error(err);
+      this.pending = null;
+      this.toast('No se pudo enviar la orden', 'alert');
+      this.render();
+      return;
+    }
+    if (!this.pending) return; // ya se resolvió
+    this.pending.timer = setTimeout(() => {
+      this.pending = null;
+      this.link.cancelar(action).catch(() => {});
+      this.toast('La cerradura no respondió. ¿Está encendida y con Wi-Fi?', 'alert', 4500);
+      this.render();
+    }, COMMAND_TIMEOUT_MS);
+  }
+
+  /* ═════════ Render ═════════ */
+
+  render() {
+    const state = this.uiState;
+    const pending = !!this.pending;
+    document.body.dataset.state = state;
+    if (pending) document.body.dataset.pending = this.pending.action;
+    else delete document.body.dataset.pending;
+
+    $('#stateTitle').textContent = {
+      unknown: 'Conectando…', closed: 'Cerrada', open: 'Abierta', blocked: 'Bloqueada',
+    }[state];
+    this.renderSub();
+
+    const canOpen = state === 'closed' && !pending;
+    const canClose = state === 'open' && !pending;
+    $$('[data-action="abrir"]').forEach((b) => { b.disabled = !canOpen; });
+    $$('[data-action="cerrar"]').forEach((b) => { b.disabled = !canClose; });
+    $$('[data-action="desbloquear"]').forEach((b) => {
+      b.disabled = pending;
+      b.textContent = this.pending?.action === 'desbloquear' ? 'Desbloqueando…' : 'Desbloquear';
+    });
+
+    $('#blockBanner').hidden = state !== 'blocked';
+
+    const tries = this.lock?.bloqueado ? MAX_TRIES : Math.min(this.lock?.intentos || 0, MAX_TRIES);
+    $$('#tries span').forEach((el, i) => el.classList.toggle('on', i < tries));
+    $('#triesText').textContent =
+      this.lock?.bloqueado ? 'Bloqueado. Solo se puede desbloquear desde esta web con el PIN.'
+      : tries === 0 ? 'Sin intentos fallidos.'
+      : `${tries} de ${MAX_TRIES} intentos fallidos. Al tercero se bloquea.`;
+
+    this.renderLink();
+  }
+
+  renderSub() {
+    const sub = $('#stateSub');
+    if (this.pending) {
+      sub.textContent = { abrir: 'Abriendo…', cerrar: 'Cerrando…', desbloquear: 'Desbloqueando…' }[this.pending.action] + ' esperando a la cerradura';
+      return;
+    }
+    if (!this.lock) { sub.textContent = this.online ? 'Esperando datos de la cerradura' : 'Buscando la cerradura'; return; }
+    if (this.lock.bloqueado) { sub.textContent = 'El teclado de la puerta no responde'; return; }
+    const what = SUB[this.lock.metodo] || '';
+    const when = this.lastChangeAt ? relTime(this.lastChangeAt) : '';
+    sub.textContent = [what, when].filter(Boolean).join(' · ') || ' ';
+  }
+
+  renderLink() {
+    const chip = $('#linkChip');
+    chip.dataset.online = String(this.online);
+    $('#linkText').textContent = this.online ? 'En línea' : 'Sin conexión';
+  }
+
+  /* ═════════ Actividad ═════════ */
+
+  log(text, tone = 'neutral') {
+    this.activity.unshift({ t: Date.now(), text, tone });
+    this.activity = this.activity.slice(0, 20);
+    store.set(ACTIVITY_KEY, this.activity);
+    this.renderActivity(true);
+  }
+
+  renderActivity(fresh = false) {
+    const list = $('#activity');
+    list.replaceChildren(...this.activity.map((a, i) => {
+      const li = document.createElement('li');
+      if (fresh && i === 0) li.className = 'fresh';
+      const mark = document.createElement('span');
+      mark.className = 'mark';
+      mark.dataset.tone = a.tone;
+      const text = document.createElement('span');
+      text.textContent = a.text;
+      const time = document.createElement('time');
+      time.dateTime = new Date(a.t).toISOString();
+      time.textContent = clock(a.t);
+      li.append(mark, text, time);
+      return li;
+    }));
+    $('#activityEmpty').hidden = this.activity.length > 0;
+  }
+
+  /* ═════════ Pestañas ═════════ */
+
+  bindTabs() {
+    $$('.tab').forEach((t) => t.addEventListener('click', () => this.setTab(t.dataset.tab)));
+  }
+
+  setTab(tab) {
+    if (tab !== 'cerradura' && tab !== 'camara') tab = 'cerradura';
+    document.body.dataset.tab = tab;
+    $('#viewCerradura').hidden = tab !== 'cerradura';
+    $('#viewCamara').hidden = tab !== 'camara';
+    $$('.tab').forEach((t) => {
+      if (t.dataset.tab === tab) t.setAttribute('aria-current', 'page');
+      else t.removeAttribute('aria-current');
+    });
+    store.set(TAB_KEY, tab);
+    window.scrollTo(0, 0);
+    if (tab === 'camara') this.startCamera();
+    this.syncCameraLoop();
+  }
+
+  /* ═════════ Botones de acción ═════════ */
+
+  bindActions() {
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-action]');
+      if (!btn || btn.disabled) return;
+      const action = btn.dataset.action;
+      if (action === 'abrir') {
+        this.askPin({ title: 'Abrir la cerradura', sub: 'Ingresá el PIN de seguridad', onOk: () => this.send('abrir', 'desde la web') });
+      } else if (action === 'cerrar') {
+        this.send('cerrar', 'desde la web');
+      } else if (action === 'desbloquear') {
+        this.askPin({ title: 'Desbloquear el teclado', sub: 'Ingresá el PIN para volver a habilitarlo', onOk: () => this.send('desbloquear') });
+      }
+    });
+  }
+
+  /* ═════════ PIN ═════════ */
+
+  askPin({ title, sub, onOk }) {
+    this.pin = { value: '', onOk };
+    $('#pinTitle').textContent = title;
+    $('#pinSub').textContent = sub;
+    $('#pinError').textContent = '';
+    this.renderPinDots();
+    this.openSheet('sheetPin');
+  }
+
+  bindPinPad() {
+    $('#pinpad').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) this.pinKey(b.dataset.k);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (!$('#sheetPin').classList.contains('open')) return;
+      if (/^\d$/.test(e.key)) this.pinKey(e.key);
+      else if (e.key === 'Backspace') this.pinKey('back');
+    });
+  }
+
+  pinKey(k) {
+    if (k === 'cancel') return this.closeSheets();
+    if ($('#pinDots').classList.contains('shake')) return;
+    $('#pinError').textContent = '';
+    if (k === 'back') this.pin.value = this.pin.value.slice(0, -1);
+    else if (this.pin.value.length < PIN_LENGTH) this.pin.value += k;
+    this.renderPinDots();
+
+    if (this.pin.value.length === PIN_LENGTH) {
+      if (this.pin.value === PIN) {
+        const ok = this.pin.onOk;
+        this.pin = { value: '', onOk: null };
+        setTimeout(() => { this.closeSheets(); ok?.(); }, 120);
+      } else {
+        const dots = $('#pinDots');
+        dots.classList.add('shake');
+        $('#pinError').textContent = 'PIN incorrecto';
+        navigator.vibrate?.([40, 40, 40]);
+        setTimeout(() => {
+          dots.classList.remove('shake');
+          this.pin.value = '';
+          this.renderPinDots();
+        }, 420);
+      }
+    }
+  }
+
+  renderPinDots() {
+    $$('#pinDots i').forEach((d, i) => d.classList.toggle('on', i < this.pin.value.length));
+  }
+
+  /* ═════════ Hojas ═════════ */
+
+  bindSheets() {
+    $('#scrim').addEventListener('click', () => this.closeSheets());
+    document.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) this.closeSheets(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') this.closeSheets(); });
+  }
+
+  openSheet(id) {
+    $$('.sheet.open').forEach((s) => s.classList.remove('open'));
+    this.lastFocus = document.activeElement;
+    $('#scrim').classList.add('on');
+    const sheet = $('#' + id);
+    sheet.classList.add('open');
+    const focusable = sheet.querySelector('input') || sheet.querySelector('button:not([disabled])');
+    setTimeout(() => focusable?.focus({ preventScroll: true }), 60);
+  }
+
+  closeSheets() {
+    $$('.sheet.open').forEach((s) => s.classList.remove('open'));
+    $('#scrim').classList.remove('on');
+    this.lastFocus?.focus?.({ preventScroll: true });
+  }
+
+  /* ═════════ Cámara y reconocimiento ═════════ */
+
+  async startCamera() {
+    if (this.cameraState === 'starting' || this.cameraState === 'on') return;
+    this.cameraState = 'starting';
+    const veil = $('#cameraVeil');
+    veil.classList.remove('gone');
+    $('#btnCameraRetry').hidden = true;
+    $('#cameraMsg').textContent = 'Pidiendo permiso de cámara…';
+
+    const models = this.modelsPromise ||= this.engine.loadModels();
+
+    try {
+      await this.engine.startCamera();
+    } catch (err) {
+      console.error(err);
+      this.cameraState = 'error';
+      $('#cameraMsg').textContent = 'Necesito permiso para usar la cámara.';
+      const retry = $('#btnCameraRetry');
+      retry.hidden = false;
+      retry.onclick = () => this.startCamera();
+      this.setScan('Cámara desactivada', 'alert');
       return;
     }
 
-    // Período de enfriamiento breve
-    if (ahora < this.cooldownUntil) {
-      const restantes = Math.ceil((this.cooldownUntil - ahora) / 1000);
-      if (this.dom.cooldownTimer) this.dom.cooldownTimer.textContent = `ESPERA: ${restantes}s`;
-      if (this.dom.statusText) this.dom.statusText.textContent = "Acceso concedido recientemente";
-      if (this.dom.statusPulse) this.dom.statusPulse.className = "pulse-ring active";
-      return;
-    } else {
-      if (this.dom.cooldownTimer) this.dom.cooldownTimer.textContent = "";
+    this.cameraState = 'on';
+    veil.classList.add('gone');
+    this.setScan('Cargando reconocimiento…', 'idle');
+    this.engine.onFaceDetected = (r) => this.onFace(r);
+    const ok = await models;
+    if (!ok) { this.modelsPromise = null; this.setScan('No se pudo cargar el reconocimiento. Revisá internet.', 'alert'); return; }
+    this.setScan(this.engine.knownFaces.length ? 'Mirá a la cámara' : 'Registrá un rostro para empezar', 'idle');
+    this.syncCameraLoop();
+  }
+
+  syncCameraLoop() {
+    const active = document.body.dataset.tab === 'camara' && !document.hidden && this.cameraState === 'on';
+    if (active) this.engine.startLoop();
+    else this.engine.stopLoop();
+  }
+
+  setScan(text, tone) {
+    $('#scanText').textContent = text;
+    $('#scanLine').dataset.tone = tone;
+  }
+
+  onFace({ hasFace, match }) {
+    this.frames++;
+    const reticle = $('#reticle');
+    const state = this.uiState;
+
+    if (state === 'blocked') {
+      reticle.dataset.mode = 'idle';
+      return this.setScan('Cerradura bloqueada: desbloqueala primero', 'alert');
     }
+    if (state === 'open') {
+      reticle.dataset.mode = 'ok';
+      return this.setScan('La cerradura está abierta', 'ok');
+    }
+    if (this.pending?.action === 'abrir') return;
+    if (Date.now() < this.faceCooldownUntil) return;
 
     if (!hasFace) {
-      if (reticle) reticle.className = "scan-reticle";
-      if (this.dom.statusText) this.dom.statusText.textContent = "Esperando rostro...";
-      if (this.dom.statusPulse) this.dom.statusPulse.className = "pulse-ring";
-      return;
+      reticle.dataset.mode = 'idle';
+      return this.setScan(this.engine.knownFaces.length ? 'Mirá a la cámara' : 'Registrá un rostro para empezar', 'idle');
+    }
+    if (!match) {
+      reticle.dataset.mode = 'unknown';
+      return this.setScan('Rostro no registrado', 'alert');
     }
 
-    if (match) {
-      // 🟢 Rostro Autorizado Detectado
-      if (reticle) reticle.className = "scan-reticle authorized";
-      if (this.dom.statusText) this.dom.statusText.textContent = `AUTORIZADO: ${match.name.toUpperCase()} (${match.confidence}%)`;
-      if (this.dom.statusPulse) this.dom.statusPulse.className = "pulse-ring active";
-
-      // Disparar Apertura Biométrica
-      this.triggerUnlock(match.name);
-
-    } else {
-      // 🔴 Rostro No Reconocido
-      if (reticle) reticle.className = "scan-reticle unauthorized";
-      if (this.dom.statusText) this.dom.statusText.textContent = "Rostro no registrado";
-      if (this.dom.statusPulse) this.dom.statusPulse.className = "pulse-ring denied";
+    reticle.dataset.mode = 'ok';
+    this.setScan(`Hola, ${match.name}`, 'ok');
+    if (state === 'closed') {
+      this.faceCooldownUntil = Date.now() + FACE_COOLDOWN_MS;
+      this.send('abrir', `por ${match.name} (rostro)`);
     }
   }
 
-  /**
-   * Modal de autorización con contraseña para abrir la cerradura
-   */
-  promptUnlockAuth(methodName = "Manual") {
-    this.pendingUnlockMethod = methodName;
-    if (this.dom.inputUnlockPassword) {
-      this.dom.inputUnlockPassword.value = '';
-      this.dom.inputUnlockPassword.type = 'password';
-    }
-    if (this.dom.unlockErrorMsg) {
-      this.dom.unlockErrorMsg.textContent = '';
-      this.dom.unlockErrorMsg.style.display = 'none';
-    }
-    if (this.dom.modalAuthUnlock) {
-      this.dom.modalAuthUnlock.classList.add('open');
-      setTimeout(() => {
-        if (this.dom.inputUnlockPassword) this.dom.inputUnlockPassword.focus();
-      }, 150);
-    }
-  }
+  /* ═════════ Registrar rostro ═════════ */
 
-  closeUnlockAuth() {
-    if (this.dom.modalAuthUnlock) {
-      this.dom.modalAuthUnlock.classList.remove('open');
-    }
-    this.pendingUnlockMethod = null;
-  }
-
-  /**
-   * Ejecuta la orden de apertura a través de Firebase Realtime Database
-   */
-  async triggerUnlock(userName) {
-    this.cooldownUntil = Date.now() + COOLDOWN_DURATION;
-    this.playUnlockChime();
-    this.showToast(`🔓 Acceso concedido a ${userName}`);
-
-    if (window._firebaseAbrirRemoto) {
-      await window._firebaseAbrirRemoto("ORDEN: " + userName);
-    } else {
-      console.log(`[LOCAL] Apertura concedida para: ${userName}`);
-    }
-  }
-
-  /**
-   * Enlaza botones y modales
-   */
-  bindUIEvents() {
-    // Exponer función global para que cualquier botón de la interfaz requiera contraseña
-    window.solicitarPinApertura = (metodo = "Panel Web") => {
-      this.initAudio();
-      this.promptUnlockAuth(metodo);
-    };
-
-    // ── BOTÓN CERRAR EN LA CÁMARA (Abajo a la derecha) ──
-    if (this.dom.btnQuickLockCamera) {
-      this.dom.btnQuickLockCamera.addEventListener('click', (e) => {
-        e.stopPropagation();
-        this.initAudio();
-        if (window._firebaseCerrarRemoto) {
-          window._firebaseCerrarRemoto("Cámara Web");
-        }
-        this.playBeep(440, 0.12);
-        this.showToast("🔒 Cerradura bloqueada");
-      });
-    }
-
-    // Escuchar el evento de instalación de PWA (Chrome, Edge, Android)
-    window.addEventListener('beforeinstallprompt', (e) => {
-      e.preventDefault();
-      this.deferredPrompt = e;
-      console.log("📲 Evento beforeinstallprompt capturado!");
-      if (this.dom.installNativeSection) {
-        this.dom.installNativeSection.style.display = 'block';
-      }
+  bindEnroll() {
+    $('#btnEnroll').addEventListener('click', () => {
+      if (this.cameraState !== 'on') return this.toast('Primero activá la cámara', 'alert');
+      if (!this.engine.isModelLoaded) return this.toast('El reconocimiento todavía se está cargando', 'alert');
+      $('#enrollName').value = '';
+      $('#enrollError').textContent = '';
+      this.openSheet('sheetEnroll');
     });
-
-    window.addEventListener('appinstalled', () => {
-      console.log("🎉 PWA instalada exitosamente!");
-      this.deferredPrompt = null;
-      if (this.dom.labelInstallApp) {
-        this.dom.labelInstallApp.textContent = "Instalada";
-      }
-      this.showToast("¡Aplicación instalada!");
-    });
-
-    // Tap en cualquier parte del visor de cámara para desbloquear autoplay si el navegador lo pausó
-    if (this.dom.cameraWrapper) {
-      this.dom.cameraWrapper.addEventListener('click', () => {
-        if (this.dom.video && this.dom.video.paused) {
-          console.log("Tapping cámara para forzar video.play()...");
-          this.dom.video.play().catch(e => console.warn("play err:", e));
-        }
-      });
-    }
-
-    // Botón Descargar / Instalar App
-    if (this.dom.btnInstallApp) {
-      this.dom.btnInstallApp.addEventListener('click', () => {
-        if (this.deferredPrompt) {
-          this.deferredPrompt.prompt();
-          this.deferredPrompt.userChoice.then(({ outcome }) => {
-            console.log(`Resultado de instalación: ${outcome}`);
-            if (outcome === 'accepted') {
-              this.deferredPrompt = null;
-            }
-          });
-        } else {
-          this.openInstallModal();
-        }
-      });
-    }
-
-    // Botón de instalación nativa dentro del modal
-    if (this.dom.btnTriggerNativeInstall) {
-      this.dom.btnTriggerNativeInstall.addEventListener('click', () => {
-        if (this.deferredPrompt) {
-          this.deferredPrompt.prompt();
-          this.deferredPrompt.userChoice.then(() => {
-            this.closeInstallModal();
-          });
-        }
-      });
-    }
-
-    if (this.dom.btnCloseInstallModal) {
-      this.dom.btnCloseInstallModal.addEventListener('click', () => this.closeInstallModal());
-    }
-    if (this.dom.btnCloseInstallSheet) {
-      this.dom.btnCloseInstallSheet.addEventListener('click', () => this.closeInstallModal());
-    }
-
-    // ── BOTÓN MANUAL UNLOCK: Requiere Contraseña ──
-    if (this.dom.btnManualUnlock) {
-      this.dom.btnManualUnlock.addEventListener('click', () => {
-        this.initAudio();
-        this.promptUnlockAuth("Manual");
-      });
-    }
-
-    // ── MODAL 4: PIN DE SEGURIDAD PARA ABRIR ──
-    if (this.dom.btnToggleUnlockPassword && this.dom.inputUnlockPassword) {
-      this.dom.btnToggleUnlockPassword.addEventListener('click', () => {
-        const isPwd = this.dom.inputUnlockPassword.type === 'password';
-        this.dom.inputUnlockPassword.type = isPwd ? 'text' : 'password';
-      });
-    }
-
-    if (this.dom.inputUnlockPassword) {
-      this.dom.inputUnlockPassword.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          if (this.dom.btnConfirmAuthUnlock) this.dom.btnConfirmAuthUnlock.click();
-        }
-      });
-    }
-
-    if (this.dom.btnConfirmAuthUnlock) {
-      this.dom.btnConfirmAuthUnlock.addEventListener('click', async () => {
-        const pin = this.dom.inputUnlockPassword ? this.dom.inputUnlockPassword.value.trim() : '';
-        if (pin !== '201106') {
-          if (this.dom.unlockErrorMsg) {
-            this.dom.unlockErrorMsg.textContent = "Contraseña incorrecta. Acceso denegado.";
-            this.dom.unlockErrorMsg.style.display = 'block';
+    $('#enrollName').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#btnEnrollNext').click(); } });
+    $('#btnEnrollNext').addEventListener('click', () => {
+      const name = $('#enrollName').value.trim();
+      if (!name) { $('#enrollError').textContent = 'Escribí un nombre'; return $('#enrollName').focus(); }
+      this.askPin({
+        title: 'Confirmá con el PIN',
+        sub: `Para registrar a ${name}`,
+        onOk: async () => {
+          this.setScan('Mirá de frente a la cámara…', 'idle');
+          try {
+            const user = await this.engine.enrollCurrentFace(name);
+            this.renderUsers();
+            this.toast(`${user.name} quedó registrado`, 'open');
+          } catch (err) {
+            this.toast(err.message || 'No se pudo registrar', 'alert', 4000);
           }
-          this.playBeep(200, 0.25);
-          if (this.dom.inputUnlockPassword) {
-            this.dom.inputUnlockPassword.classList.add('input-error-shake');
-            setTimeout(() => this.dom.inputUnlockPassword.classList.remove('input-error-shake'), 600);
-            this.dom.inputUnlockPassword.focus();
-            this.dom.inputUnlockPassword.select();
-          }
-          return;
-        }
-
-        const method = this.pendingUnlockMethod || "Manual";
-        this.closeUnlockAuth();
-        await this.triggerUnlock(method);
+        },
       });
-    }
-
-    if (this.dom.btnCancelAuthUnlock) {
-      this.dom.btnCancelAuthUnlock.addEventListener('click', () => this.closeUnlockAuth());
-    }
-    if (this.dom.btnCloseAuthUnlock) {
-      this.dom.btnCloseAuthUnlock.addEventListener('click', () => this.closeUnlockAuth());
-    }
-
-    // Helper para mensajes de error al enrolar
-    this.showEnrollError = (msg) => {
-      if (this.dom.enrollErrorMsg) {
-        this.dom.enrollErrorMsg.textContent = msg;
-        this.dom.enrollErrorMsg.style.display = 'block';
-      }
-    };
-    this.hideEnrollError = () => {
-      if (this.dom.enrollErrorMsg) {
-        this.dom.enrollErrorMsg.textContent = '';
-        this.dom.enrollErrorMsg.style.display = 'none';
-      }
-    };
-
-    // Botón Enrolar Rostro
-    if (this.dom.btnRegisterFace) {
-      this.dom.btnRegisterFace.addEventListener('click', () => {
-        this.initAudio();
-        this.dom.inputUserName.value = '';
-        if (this.dom.inputAdminPassword) {
-          this.dom.inputAdminPassword.value = '';
-          this.dom.inputAdminPassword.type = 'password';
-        }
-        this.hideEnrollError();
-        this.dom.modalPromptName.classList.add('open');
-        setTimeout(() => this.dom.inputUserName.focus(), 150);
-      });
-    }
-
-    // Toggle para visualizar/ocultar contraseña de admin al enrolar
-    if (this.dom.btnTogglePassword && this.dom.inputAdminPassword) {
-      this.dom.btnTogglePassword.addEventListener('click', () => {
-        const isPwd = this.dom.inputAdminPassword.type === 'password';
-        this.dom.inputAdminPassword.type = isPwd ? 'text' : 'password';
-      });
-    }
-
-    // Tecla Enter en campos del modal de enrolar
-    if (this.dom.inputUserName) {
-      this.dom.inputUserName.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          if (this.dom.inputAdminPassword) this.dom.inputAdminPassword.focus();
-        }
-      });
-    }
-    if (this.dom.inputAdminPassword) {
-      this.dom.inputAdminPassword.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          this.dom.btnConfirmEnroll.click();
-        }
-      });
-    }
-
-    // Confirmar Enrolamiento con Contraseña de Admin (201106)
-    if (this.dom.btnConfirmEnroll) {
-      this.dom.btnConfirmEnroll.addEventListener('click', async () => {
-        const name = this.dom.inputUserName.value.trim();
-        const password = this.dom.inputAdminPassword ? this.dom.inputAdminPassword.value.trim() : '';
-
-        this.hideEnrollError();
-
-        if (!name) {
-          this.showEnrollError("Ingresa un nombre para el rostro.");
-          this.dom.inputUserName.focus();
-          return;
-        }
-
-        if (password !== '201106') {
-          this.showEnrollError("Contraseña incorrecta. Acceso denegado.");
-          this.playBeep(200, 0.25);
-          if (this.dom.inputAdminPassword) {
-            this.dom.inputAdminPassword.classList.add('input-error-shake');
-            setTimeout(() => this.dom.inputAdminPassword.classList.remove('input-error-shake'), 600);
-            this.dom.inputAdminPassword.focus();
-            this.dom.inputAdminPassword.select();
-          }
-          return;
-        }
-
-        try {
-          this.dom.btnConfirmEnroll.disabled = true;
-          this.dom.btnConfirmEnroll.textContent = "Analizando...";
-
-          const nuevo = await this.engine.enrollCurrentFace(name);
-          this.dom.modalPromptName.classList.remove('open');
-          this.updateUserBadge();
-          this.showToast(`Rostro de ${nuevo.name} registrado`);
-          this.playBeep(600, 0.15);
-
-        } catch (err) {
-          this.showEnrollError(err.message || "No se detectó un rostro claro en cámara");
-          this.playBeep(200, 0.2);
-        } finally {
-          this.dom.btnConfirmEnroll.disabled = false;
-          this.dom.btnConfirmEnroll.textContent = "Guardar";
-        }
-      });
-    }
-
-    if (this.dom.btnCancelEnroll) {
-      this.dom.btnCancelEnroll.addEventListener('click', () => {
-        this.dom.modalPromptName.classList.remove('open');
-      });
-    }
-
-    // Modal de Usuarios
-    if (this.dom.btnOpenUsers) {
-      this.dom.btnOpenUsers.addEventListener('click', () => {
-        this.renderUsersList();
-        this.dom.modalUsers.classList.add('open');
-      });
-    }
-
-    if (this.dom.btnCloseModal) {
-      this.dom.btnCloseModal.addEventListener('click', () => {
-        this.dom.modalUsers.classList.remove('open');
-      });
-    }
-
-    if (this.dom.btnClearAllUsers) {
-      this.dom.btnClearAllUsers.addEventListener('click', () => {
-        if (confirm("¿Seguro que deseas eliminar todos los rostros autorizados?")) {
-          this.engine.clearAllUsers();
-          this.renderUsersList();
-          this.updateUserBadge();
-          this.showToast("Todos los usuarios borrados");
-        }
-      });
-    }
-
-    // Cerrar modales pulsando en el fondo
-    [this.dom.modalUsers, this.dom.modalPromptName, this.dom.modalInstall, this.dom.modalAuthUnlock].forEach(m => {
-      if (m) {
-        m.addEventListener('click', (e) => {
-          if (e.target === m) m.classList.remove('open');
-        });
-      }
     });
   }
 
-  openInstallModal() {
-    if (!this.dom.modalInstall) return;
-    if (this.deferredPrompt && this.dom.installNativeSection) {
-      this.dom.installNativeSection.style.display = 'block';
-    }
-    this.dom.modalInstall.classList.add('open');
+  /* ═════════ Usuarios ═════════ */
+
+  bindUsers() {
+    $('#btnUsers').addEventListener('click', () => { this.renderUsers(); this.resetClearAll(); this.openSheet('sheetUsers'); });
+    $('#userList').addEventListener('click', (e) => {
+      const del = e.target.closest('[data-del]');
+      if (!del) return;
+      this.engine.removeUser(del.dataset.del);
+      this.renderUsers();
+    });
+    $('#btnClearUsers').addEventListener('click', (e) => {
+      const btn = e.currentTarget;
+      if (btn.dataset.armed !== 'true') {
+        btn.dataset.armed = 'true';
+        btn.textContent = 'Tocá de nuevo para eliminar todos';
+        this.clearTimer = setTimeout(() => this.resetClearAll(), 3000);
+        return;
+      }
+      this.engine.clearAllUsers();
+      this.resetClearAll();
+      this.renderUsers();
+      this.toast('Se eliminaron todos los rostros');
+    });
   }
 
-  closeInstallModal() {
-    if (this.dom.modalInstall) {
-      this.dom.modalInstall.classList.remove('open');
-    }
+  resetClearAll() {
+    clearTimeout(this.clearTimer);
+    const btn = $('#btnClearUsers');
+    btn.dataset.armed = 'false';
+    btn.textContent = 'Eliminar todos';
   }
 
-  renderUsersList() {
-    const list = this.dom.userList;
-    if (!list) return;
-    list.innerHTML = '';
-
+  renderUsers() {
     const users = this.engine.knownFaces;
-    if (users.length === 0) {
-      list.innerHTML = '<li class="empty-state">No hay rostros registrados aún.</li>';
-      return;
-    }
-
-    users.forEach(u => {
+    const count = $('#userCount');
+    count.textContent = String(users.length);
+    count.dataset.zero = String(users.length === 0);
+    $('#usersEmpty').hidden = users.length > 0;
+    $('#btnClearUsers').hidden = users.length === 0;
+    $('#userList').replaceChildren(...users.map((u) => {
       const li = document.createElement('li');
-      li.className = 'user-item';
-      li.innerHTML = `
-        <div class="user-info">
-          <img src="${u.thumbnail}" class="user-avatar" alt="${u.name}">
-          <div>
-            <div class="user-name">${u.name}</div>
-            <div class="user-date">Registrado: ${u.date}</div>
-          </div>
-        </div>
-        <button class="btn-delete-user" data-id="${u.id}" title="Eliminar">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="3 6 5 6 21 6"></polyline>
-            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-          </svg>
-        </button>
-      `;
+      const img = document.createElement('img');
+      img.src = u.thumbnail; img.alt = '';
+      const who = document.createElement('div');
+      who.className = 'who';
+      const name = document.createElement('strong'); name.textContent = u.name;
+      const date = document.createElement('span'); date.textContent = `Registrado el ${u.date}`;
+      who.append(name, date);
+      const del = document.createElement('button');
+      del.className = 'del'; del.dataset.del = u.id; del.textContent = 'Quitar';
+      del.setAttribute('aria-label', `Quitar a ${u.name}`);
+      li.append(img, who, del);
+      return li;
+    }));
+  }
 
-      li.querySelector('.btn-delete-user').addEventListener('click', () => {
-        this.engine.removeUser(u.id);
-        this.renderUsersList();
-        this.updateUserBadge();
-      });
+  /* ═════════ Instalar ═════════ */
 
-      list.appendChild(li);
+  bindInstall() {
+    const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    const btn = $('#btnInstall');
+    btn.hidden = !!standalone;
+    const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    $('#stepsIos').hidden = !ios;
+    $('#stepsAndroid').hidden = ios;
+
+    window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installPrompt = e; });
+    window.addEventListener('appinstalled', () => { btn.hidden = true; this.toast('App instalada'); });
+    btn.addEventListener('click', async () => {
+      if (this.installPrompt) {
+        this.installPrompt.prompt();
+        await this.installPrompt.userChoice.catch(() => {});
+        this.installPrompt = null;
+      } else {
+        this.openSheet('sheetInstall');
+      }
     });
   }
 
-  updateUserBadge() {
-    if (this.dom.badgeUserCount && this.engine) {
-      this.dom.badgeUserCount.textContent = this.engine.knownFaces.length;
-    }
-  }
+  /* ═════════ Toasts ═════════ */
 
-  showToast(msg) {
-    if (!this.dom.toastMsg || !this.dom.toast) return;
-    this.dom.toastMsg.textContent = msg;
-    this.dom.toast.classList.add('show');
-    clearTimeout(this._toastTimeout);
-    this._toastTimeout = setTimeout(() => {
-      this.dom.toast.classList.remove('show');
-    }, 2800);
-  }
-
-  // ── SONIDOS SINTETIZADOS WEBAUDIO ──
-  initAudio() {
-    if (!this.audioContext) {
-      this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    }
-  }
-
-  playBeep(freq, dur) {
-    try {
-      this.initAudio();
-      const osc = this.audioContext.createOscillator();
-      const gain = this.audioContext.createGain();
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.05, this.audioContext.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, this.audioContext.currentTime + dur);
-      osc.connect(gain);
-      gain.connect(this.audioContext.destination);
-      osc.start();
-      osc.stop(this.audioContext.currentTime + dur);
-    } catch(e) {}
-  }
-
-  playUnlockChime() {
-    this.playBeep(523.25, 0.1);
-    setTimeout(() => this.playBeep(659.25, 0.1), 80);
-    setTimeout(() => this.playBeep(783.99, 0.2), 160);
-  }
-
-  startFPSMeter() {
-    let lastTime = performance.now();
-    let frameCount = 0;
-
-    const tick = () => {
-      frameCount++;
-      const now = performance.now();
-      if (now - lastTime >= 1000) {
-        if (this.dom.fpsCounter) this.dom.fpsCounter.textContent = `${frameCount} FPS`;
-        frameCount = 0;
-        lastTime = now;
-      }
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
+  toast(text, tone = 'neutral', ms = 2600) {
+    const host = $('#toasts');
+    while (host.children.length >= 2) host.firstElementChild.remove();
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.dataset.tone = tone;
+    el.textContent = text;
+    host.append(el);
+    setTimeout(() => {
+      el.classList.add('leaving');
+      setTimeout(() => el.remove(), 220);
+    }, ms);
   }
 }
 
-// ── BOOT: arranque seguro ──
-function boot() {
-  if (window.__nexusAppLoaded) return;
-  window.__nexusAppLoaded = true;
-  console.log("🔧 boot() inicializando NexusApp...");
-  const app = new NexusApp();
-  app.init();
-  window.nexusApp = app;
+/* ───── utilidades de tiempo ───── */
+function clock(t) {
+  const d = new Date(t);
+  const today = new Date().toDateString() === d.toDateString();
+  const hm = d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+  return today ? hm : `${d.toLocaleDateString('es-AR', { day: 'numeric', month: 'short' })} ${hm}`;
+}
+function relTime(t) {
+  const s = Math.round((Date.now() - t) / 1000);
+  if (s < 45) return 'recién';
+  const m = Math.round(s / 60);
+  if (m < 60) return `hace ${m} min`;
+  const h = Math.round(m / 60);
+  return h < 24 ? `hace ${h} h` : clock(t);
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', boot);
-} else {
-  boot();
-}
+new App().init();
